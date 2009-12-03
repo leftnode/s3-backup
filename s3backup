@@ -1,0 +1,660 @@
+#!/usr/bin/php
+<?php
+
+/**
+ *
+ * Copyright (c) 2009, Vic Cherubini <vmc@leftnode.com>.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * - Redistributions of source code must retain the above copyright notice,
+ *   this list of conditions and the following disclaimer.
+ * - Redistributions in binary form must reproduce the above copyright
+ *   notice, this list of conditions and the following disclaimer in the
+ *   documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Amazon S3 is a trademark of Amazon.com, Inc. or its affiliates.
+ */
+
+$pwd = realpath("./") . DIRECTORY_SEPARATOR;
+
+define('S3BACKUP_VERSION', '0.1.2', false);
+define('S3BACKUP_NAME', 's3backup', false);
+
+require_once $pwd . 'S3.php';
+
+if ( false === file_exists($pwd . 'configure.php') ) {
+	s3b_echo("The configure.php file does not exist.", true);
+}
+
+require_once $pwd . 'configure.php';
+
+/* Program configuration. */
+$actionList = array(
+	'create-bucket' => array(
+		'help' => S3BACKUP_NAME . " create-bucket <bucket-name>" . PHP_EOL . "Where <bucket-name> can be composed of a single bucket, or subbuckets: bucket1.bucket2.bucket3",
+		'param-count' => array(1,1)
+	),
+	'db-backup' => array(
+		'help' => S3BACKUP_NAME . " db-backup <database-name> <bucket-name> [--include=[table1 [table2 [table3 [tableN]]]]] or [--ignore=[table1 [table2 [table3 [tableN]]]]]" . PHP_EOL . "You must specify at least one database name and bucket name, and they must be in that order, databases first, then bucket" . PHP_EOL . "If the database is \"*\", all databases on that server will be backed up." . PHP_EOL . "If you specify an include table and it does not exist in the database, an error will occur." . PHP_EOL . "If no tables are specified in the --include parameter, the entire database is backed up." . PHP_EOL . "You can optionally specify tables you don't want to back up with the --ignore flag. Any tables after this will be ignored and not backed up." . PHP_EOL . "You can't however, have both --include and --ignore flags",
+		'param-count' => array(2,10000)
+	),
+	'file-backup' => array(
+		'help' => S3BACKUP_NAME . " file-backup <file-name> [file-name2 [file-name3 [file-nameN]]] <bucket-name>" . PHP_EOL . "If <file-name> is a directory, it will be tar'ed first, and then backed up.",
+		'param-count' => array(2,10000)
+	),
+	'view-bucket' => array(
+		'help' => S3BACKUP_NAME . " view-bucket <bucket-name>",
+		'param-count' => array(1,1)
+	),
+	'get-backup' => array(
+		'help' => S3BACKUP_NAME . " get-backup <bucket-name>" . PHP_EOL . "After you've typed in a <bucket-name>, you can select an object to download to ./",
+		'param-count' => array(1,1)
+	),
+	'delete-backup' => array(
+		'help' => S3BACKUP_NAME . " delete-backup <bucket-name>" . PHP_EOL . "After you've typed in a <bucket-name>, you can select an object to delete, confirm you actually want to delete it, and then delete it.",
+		'param-count' => array(1,1)
+	),
+	'list-buckets' => array(
+		'help' => S3BACKUP_NAME . " list-buckets" . PHP_EOL . "Will list all buckets in the S3 account.",
+		'param-count' => array(0,0)
+	),
+	'empty-bucket' => array(
+		'help' => S3BACKUP_NAME . " empty-bucket <bucket-name>" . PHP_EOL . "This will empty all objects within a bucket. You will be asked for confirmation to do so.",
+		'param-count' => array(1,1)
+	),
+	'delete-bucket' => array(
+		'help' => S3BACKUP_NAME . " delete-bucket <bucket-name>" . PHP_EOL . "This will delete a bucket, emptying all objects first. You will only be prompted to delete the bucket, and not each object.",
+		'param-count' => array(1,1)
+	),
+	'help' => array(
+		'help' => S3BACKUP_NAME . " help <action>",
+		'param-count' => array(0,1)
+	)
+);
+
+/* Ensure that appropriate configuration values are present. */
+s3b_confirm_config('s3AccessKeyId');
+s3b_confirm_config('s3AccessKey');
+s3b_confirm_config('accessMethod');
+
+$accessMethodList = array(S3::ACL_PRIVATE, S3::ACL_PUBLIC_READ, S3::ACL_PUBLIC_READ_WRITE);
+if ( false === in_array($accessMethod, $accessMethodList) ) {
+	s3b_echo("The accessMethod should be one of: " . implode(', ', $accessMethodList), true);
+}
+
+if ( $argc < 2 ) {
+	s3b_usage();
+}
+
+$action = trim($argv[1]);
+if ( false === in_array($action, array_keys($actionList)) ) {
+	s3b_echo($action . " is not a valid action.");
+	s3b_usage();
+}
+
+/* Get the param count for the specified action and ensure everything matches up. */
+$paramLength = $argc-2;
+$paramCount  = $actionList[$action]['param-count'];
+$lowCount    = $paramCount[0];
+$highCount   = $paramCount[1];
+
+if ( $paramLength < $lowCount || $paramLength > $highCount ) {
+	s3b_usage($action);
+}
+
+/* Create a new connection to S3. */
+$s3 = new S3($s3AccessKeyId, $s3AccessKey);
+
+switch ( $action ) {
+	case 'create-bucket': {
+		$bucketName = trim($argv[2]);
+		s3b_create_bucket($bucketName);
+		break;
+	}
+	
+	case 'db-backup': {
+		s3b_confirm_config('dbServer');
+		s3b_confirm_config('dbUsername');
+		s3b_confirm_config('dbPassword');
+		
+		$bucketName = NULL;
+		$dbList = $includeTableList = $ignoreTableList = array();
+		
+		$argv = array_slice($argv, 2);
+		$argc -= 2;
+		
+		$dbList = array($argv[0]);
+		$bucketName = $argv[1];
+		
+		for ( $i=0; $i<$argc; $i++ ) {
+			if ( false !== stripos($argv[$i], "--ignore=") ) {
+				$ignoreTableList = s3b_parse_argv($i, $argc, "--ignore=", $argv);
+			}
+			
+			if ( false !== stripos($argv[$i], "--include=") ) {
+				$includeTableList = s3b_parse_argv($i, $argc, "--include=", $argv);
+			}
+		}
+
+		if ( count($ignoreTableList) != 0 && count($includeTableList) != 0 ) {
+			s3b_echo("You can not both ignore and include tables at the same time.", true);
+		}
+
+		if ( 0 == count($dbList) ) {
+			s3b_echo("You must specify at least one database to backup.", true);
+		}
+
+		$dbUsernameSafe = escapeshellcmd($dbUsername);
+		$dbPasswordSafe = escapeshellcmd($dbPassword);
+		$dbServerSafe   = escapeshellcmd($dbServer);
+		
+		// Determine if we're doing all databases on the server
+		if ( 1 == count($dbList) && "*" == $dbList[0] ) {
+			// Get a list of all databases
+			$dbList = array();
+			$dbConn = new mysqli($dbServer, $dbUsername, $dbPassword);
+			$result_db = $dbConn->query("SHOW DATABASES");
+			
+			if ( $result_db->num_rows > 0 ) {
+				while ( $db = $result_db->fetch_assoc() ) {
+					$dbName = trim($db['Database']);
+					
+					if ( false === in_array($dbName, array("mysql", "information_schema")) ) {
+						$dbList[] = $dbName;
+					}
+				}
+			}
+			$dbConn->close();
+		}
+		
+		foreach ( $dbList as $dbName ) {
+			$dbNameSafe = escapeshellcmd($dbName);
+			$tableList  = NULL;
+			
+			if ( count($ignoreTableList) > 0 ) {
+				$len = count($ignoreTableList);
+				for ( $i=0; $i<$len; $i++ ) {
+					$ignoreTableList[$i] = "--ignore-table=" . $dbNameSafe . "." . escapeshellcmd($ignoreTableList[$i]);
+				}
+				$tableList = implode(" ", $ignoreTableList);
+			}
+			
+			if ( count($includeTableList) > 0 ) {
+				$len = count($includeTableList);
+				for ( $i=0; $i<$len; $i++ ) {
+					$includeTableList[$i] = escapeshellcmd($includeTableList[$i]);
+				}
+				$tableList = "--tables " . implode(" ", $includeTableList);
+			}
+		
+			$dbBackupFile              = $dbName . '-' . date('YmdHis', time()) . '.sql';
+			$dbBackupFileEncrypted     = $dbBackupFile . '.gpg';
+			$dbBackupFileZipped        = $dbBackupFileEncrypted . '.bz2';
+			$dbBackupFileSafe          = escapeshellcmd($dbBackupFile);
+			$dbBackupFileEncryptedSafe = escapeshellcmd($dbBackupFileEncrypted);
+			$dbBackupFileZippedSafe    = escapeshellcmd($dbBackupFileZipped);
+			$gpgRecipientSafe          = escapeshellcmd($gpgRecipient);
+		
+			s3b_echo("Creating backup file " . $dbBackupFileZipped . ".");
+
+			$backupExec = "mysqldump -u{$dbUsernameSafe} -p{$dbPasswordSafe} -h{$dbServerSafe} {$dbNameSafe} --add-drop-table --quote-names --result-file={$dbBackupFileSafe} {$tableList} && gpg -r {$gpgRecipientSafe} -e {$dbBackupFileSafe} && bzip2 -z {$dbBackupFileEncryptedSafe}";
+			`$backupExec`;
+
+			if ( false === file_exists($dbBackupFileZipped) ) {
+				s3b_echo("Failed to create backup file " . $dbBackupFileZipped . ".", true);
+			}
+		
+			if ( true === s3b_push_object_to_bucket($dbBackupFileZipped, $dbBackupFileZipped, $bucketName) ) {
+				$backupRemoveExec = "rm -f {$dbBackupFileSafe} && rm -f {$dbBackupFileZippedSafe}";
+				`$backupRemoveExec`;
+			}
+		}
+		
+		break;
+	}
+	
+	case 'file-backup': {
+		/* N number of files are allowed, and the last argument is the name of bucket. */
+		$fileList = array_slice($argv, 2, $argc-3);
+		$bucketName   = trim($argv[$argc-1]);
+		
+		foreach ( $fileList as $fileName ) {
+			$fileNameBase = basename($fileName);
+			if ( false === file_exists($fileName) ) {
+				s3b_echo("File " . $fileName . " does not exist, and can not be backed up.", true);
+			}
+			
+			$fileNameZipped = NULL;
+			if ( true === is_dir($fileName) ) {
+				s3b_echo("File " . $fileName . " is a directory and will be archived first.");
+				
+				$fileNameZipped = $fileNameBase . '-' . date('YmdHis', time()) . '.tar.gz';
+				$fileNameSafe = escapeshellcmd($fileName);
+				$fileNameZippedSafe = escapeshellcmd($fileNameZipped);
+
+				$zipCommand = "tar -czf {$fileNameZippedSafe} {$fileNameSafe}";
+				`$zipCommand`;
+				
+				if ( false === file_exists($fileNameZipped) ) {
+					s3b_echo("Failed to create backup file " . $fileNameZipped . ".", true);
+				}
+				
+				$fileName = $fileNameBase = $fileNameZipped;
+			}
+			
+			if ( true === s3b_push_object_to_bucket($fileName, $fileNameBase, $bucketName) ) {
+				if ( false === empty($fileNameZipped) ) {
+					$backupRemoveExec = "rm -f {$fileNameZippedSafe}";
+					`$backupRemoveExec`;
+				}
+			}
+		}
+		
+		break;
+	}
+	
+	case 'view-bucket': {
+		$bucketName = trim($argv[2]);
+		s3b_print_bucket_content_list($bucketName);	
+		break;
+	}
+	
+	case 'get-backup': {
+		$bucketName = trim($argv[2]);
+		s3b_bucket_exists_print_exit($bucketName);
+		
+		$bucketList = s3b_normalize_bucket_content_list($bucketName);
+		$option = 0;
+		$len = count($bucketList);
+		
+		if ( 0 == $len ) {
+			s3b_echo("There are no objects in bucket " . $bucketName . ".");
+		} else {
+			s3b_echo("Select a backup number in  " . $bucketName . " to download:");
+			for ( $i=0; $i<$len; $i++ ) {
+				echo "    " . ($i) . ") - " . $bucketList[$i] . PHP_EOL;
+			}
+			
+			fscanf(STDIN, "%d\n", $option);
+			$option = intval($option);
+			if ( false == isset($bucketList[$option]) ) {
+				s3b_echo("Sorry, that is not a valid input option. Exiting.", true);
+			}
+			
+			$fileName = './' . $bucketList[$option];
+			$s3->getObject($bucketName, $bucketList[$option], $fileName);
+		}
+		
+		break;
+	}
+	
+	case 'delete-backup': {
+		$bucketName = trim($argv[2]);
+		s3b_bucket_exists_print_exit($bucketName);
+		
+		$bucketList = s3b_normalize_bucket_content_list($bucketName);
+		$option = 0;
+		$len = count($bucketList);
+
+		if ( 0 == $len ) {
+			s3b_echo("There are no objects in bucket " . $bucketName . ".");
+		} else {
+			s3b_echo("Select a backup number in  " . $bucketName . " to delete:");
+			for ( $i=0; $i<$len; $i++ ) {
+				echo "    " . ($i) . ") - " . $bucketList[$i] . PHP_EOL;
+			}
+			
+			fscanf(STDIN, "%d\n", $option);
+			$option = intval($option);
+			if ( false == isset($bucketList[$option]) ) {
+				s3b_echo("Sorry, that is not a valid input option. Exiting.", true);
+			}
+			
+			if ( true === s3b_confirm("Are you sure you want to delete that backup?") ) {
+				$file = $bucketList[$option];
+				s3b_echo("Deleting backup " . $file . "...");
+				if ( true === $s3->deleteObject($bucketName, $file) ) {
+					s3b_echo("Backup " . $file . " successfully removed from bucket " . $bucketName . ".");
+				}
+			}
+		}
+		
+		break;
+	}
+	
+	case 'empty-bucket': {
+		$bucketName = trim($argv[2]);
+		s3b_bucket_exists_print_exit($bucketName);
+		
+		if ( true === s3b_confirm("Are you sure you want to delete all of the contents of bucket " . $bucketName . "?") ) {
+			s3b_empty_bucket($bucketName);
+		}
+		
+		break;
+	}
+	
+	case 'delete-bucket': {
+		$bucketName = trim($argv[2]);
+		s3b_bucket_exists_print_exit($bucketName);
+		
+		if ( true == s3b_confirm("Are you sure you want to delete bucket " . $bucketName . "?") ) {
+			s3b_empty_bucket($bucketName);
+			if ( true === $s3->deleteBucket($bucketName) ) {
+				s3b_echo("Bucket " . $bucketName . " successfully deleted.");
+			} else {
+				s3b_echo("Failed to delete bucket " . $bucketName . ".");
+			}
+		}
+		
+		break;
+	}
+	
+	case 'list-buckets': {
+		s3b_print_bucket_list();
+		break;
+	}
+	
+	case 'help': {
+		$action = NULL;
+		if ( $argc >= 3 ) {
+			$action = trim($argv[2]);
+		}
+		
+		s3b_usage($action);
+		break;
+	}
+}
+
+/**
+ * Check to see if a bucket exists in the current connection.
+ */
+function s3b_bucket_exists($bucketName) {
+	global $s3;
+	
+	$bucketList = $s3->listBuckets();
+	if ( true === is_array($bucketList) ) {
+		return in_array($bucketName, $bucketList);
+	}
+	return false;
+}
+
+/**
+ * If a bucket name does not exist, this will warn the user and exit.
+ * Returns true otherwise.
+ */
+function s3b_bucket_exists_print_exit($bucketName) {
+	if ( false === s3b_bucket_exists($bucketName) ) {
+		s3b_echo("Bucket " . $bucketName . " doesn't exist.", true);
+	}
+	return true;
+}
+
+/**
+ * Prints a list of buckets.
+ */
+function s3b_print_bucket_list() {
+	global $s3;
+	
+	$bucketList = $s3->listBuckets();
+	
+	if ( true === is_array($bucketList) ) {
+		if ( 0 == count($bucketList) ) {
+			s3b_echo("There are no buckets in this account.");
+		} else {
+			foreach ( $bucketList as $bucket ) {
+				s3b_echo_item($bucket);
+			}
+		}
+	}
+}
+
+/**
+ * Echo's out the contents of a bucket.
+ */
+function s3b_print_bucket_content_list($bucketName) {
+	global $s3;
+	
+	$oneMeg = 1024*1024;
+	if ( false === s3b_bucket_exists($bucketName) ) {
+		s3b_echo("Bucket " . $bucketName . " doesn't exist.");
+	} else {
+		$bucketContents = $s3->getBucket($bucketName);
+		if ( 0 == count($bucketContents) ) {
+			s3b_echo("There are no backups within bucket " . $bucketName . ".");
+		} else {
+			foreach ( $bucketContents as $fileName => $bucketObject ) {
+				$date = date('Y-m-d H:i:s', $bucketObject['time']);
+				$fileSize = round(($bucketObject['size'] / $oneMeg), 3) . "MB";
+				
+				$item  = $fileName . PHP_EOL;
+				$item .= "        Filesize: " . $fileSize . PHP_EOL;
+				$item .= "        Date: " . $date;
+				
+				s3b_echo_item($item);
+			}
+		}
+	}
+}
+
+/**
+ * Attempt to create a bucket. If the bucket already exists, a message
+ * will be printed, otherwise, the bucket will be created.
+ */
+function s3b_create_bucket($bucketName, $supress=false) {
+	global $s3, $accessMethod;
+	
+	$bucketName = trim($bucketName);
+	if ( true === empty($bucketName) ) {
+		s3b_echo("The bucket name is empty!", true);
+	}
+	
+	if ( false === s3b_bucket_exists($bucketName) ) {
+		if ( true === $s3->putBucket($bucketName, $accessMethod) ) {
+			s3b_echo("Bucket " . $bucketName . " has been successfully created.");
+			return true;
+		}
+	} else {
+		if ( false === $supress ) {
+			s3b_echo("Bucket " . $bucketName . " exists.");
+		}
+		return true;
+	}
+
+	/* If we get here, bucket creation has failed, so die. */
+	s3b_echo("Failed to create or find bucket " . $bucketName . ".", true);
+}
+
+/**
+ * Return a list of contents in a bucket in normalized array.
+ */
+function s3b_normalize_bucket_content_list($bucketName) {
+	global $s3;
+
+	$bucketContentListNormalized = array();
+	if ( true === s3b_bucket_exists($bucketName) ) {
+		$bucketContentList = $s3->getBucket($bucketName);
+		if ( true === is_array($bucketContentList) ) {
+			if ( count($bucketContentList) > 0 ) {
+				foreach ( $bucketContentList as $objectName => $bucketObject ) {
+					$bucketContentListNormalized[] = $objectName;
+				}
+			}
+		}
+	}
+	return $bucketContentListNormalized;
+}
+
+/**
+ * Push an object into a buck and attempt to purge old objects.
+ */
+function s3b_push_object_to_bucket($objectName, $objectNameBase, $bucketName) {
+	global $s3, $accessMethod;
+	
+	/* Attempt to create the bucket if it does not exist. Suppress output if the bucket already exists. */
+	s3b_create_bucket($bucketName, true);
+
+	s3b_echo("Pushing '" . $objectName . "' as '" . $objectNameBase . "' to " . $bucketName . ". (You will be notified if this succeeds or fails).");
+	if ( true === $s3->putObjectFile($objectName, $bucketName, $objectNameBase, $accessMethod) ) {
+		s3b_echo("Object '" . $objectName . "' as '" . $objectNameBase . "' was successfully put into bucket " . $bucketName . ".");
+		s3b_purge_old_objects($bucketName);
+		return true;
+	} else {
+		s3b_echo("Failed to upload object '" . $objectName . "' as '" . $objectNameBase . "' to bucket " . $bucketName . ".");
+		return false;
+	}
+}
+
+/**
+ * Attempt to find if a specific bucket has a maximum number of objects
+ * allowed in it.
+ */
+function s3b_purge_old_objects($bucketName) {
+	global $s3, $bucketMaxCount;
+	
+	if ( true === isset($bucketMaxCount[$bucketName]) ) {
+		$contents = $s3->getBucket($bucketName);
+
+		$contentsDate = array();
+		foreach ( $contents as $fileName => $object ) {
+			$contentsDate[$fileName] = $object['time'];
+		}
+		
+		/* Element #0 is the oldest, element #N is the newest. */
+		asort($contentsDate);
+
+		/* If the length of contents is greater than the total length, find the difference and delete all of those items. */
+		$len = count($contents);
+		$maxLen = $bucketMaxCount[$bucketName];
+
+		/* This relies on the order of $contents in sorted date order already. */
+		if ( $len > $maxLen ) {
+			$i=1;
+			$delta = abs($len - $maxLen);
+
+			foreach ( $contentsDate as $objectName => $objectDate ) {
+				$s3->deleteObject($bucketName, $objectName);
+				s3b_echo("Object " . $objectName . " successfully deleted from bucket " . $bucketName . ".");
+				if ( $i == $delta ) { break; }
+				$i++;
+			}
+		}
+	}
+}
+
+/**
+ * Fancy echo out to the command line.
+ */
+function s3b_echo($line, $exit = false) {
+	echo "  >> " . $line . PHP_EOL;
+	if ( true === $exit ) { exit(1); }
+}
+
+/**
+ * Echo out for bucket contents.
+ */
+function s3b_echo_item($line) {
+	echo "    + " . $line . PHP_EOL;
+}
+
+function s3b_confirm_config($cfgVar) {
+	global $$cfgVar;
+	if ( true === empty($$cfgVar) ) {
+		s3b_echo("Configuration variable \$" . $cfgVar . " is empty.", true);
+	}
+}
+
+/**
+ * Empty all of the contents of a bucket.
+ */
+function s3b_empty_bucket($bucketName) {
+	global $s3;
+	
+	$contents = $s3->getBucket($bucketName);
+	foreach ( $contents as $objectName => $object ) {
+		$s3->deleteObject($bucketName, $objectName);
+		s3b_echo("Object " . $objectName . " successfully deleted from bucket " . $bucketName . ".");
+	}
+}
+
+/**
+ * Asks a y/n question. Returns true if y, false if n.
+ */
+function s3b_confirm($text) {
+	s3b_echo($text . " y/n");
+	$confirm = strtolower(trim(fgets(STDIN)));
+	if ( $confirm != 'y' && $confirm != 'n' ) {
+		$confirm = 'n';
+	}
+	
+	return ( 'y' == $confirm ? true : false );
+}
+
+/**
+ * How to run s3backup.
+ */
+function s3b_usage($action=NULL) {
+	global $actionList;
+	
+	echo PHP_EOL;
+	echo S3BACKUP_NAME . " usage is: s3backup <action> [object [, bucket]] [argv]" . PHP_EOL;
+	echo S3BACKUP_NAME . " is a command line utility to manage backups - version " . S3BACKUP_VERSION . "." . PHP_EOL . PHP_EOL;
+	
+	echo "[object] is the name of the object you wish to work with, generally a database, file, or bucket." . PHP_EOL;
+	echo "[bucket] is the full name of the bucket you wish to use, including sub-buckets (eg., sub-bucket.root-bucket.s3.amazonaws.com)" . PHP_EOL . PHP_EOL;
+	
+	if ( true === empty($action) ) {
+		echo "Available action's are:" . PHP_EOL;
+		foreach ( $actionList as $action => $actionData ) {
+			s3b_echo($action);
+		}
+		echo PHP_EOL;
+		echo S3BACKUP_NAME . " help <action> will print the specific help for that action." . PHP_EOL;
+	} elseif ( true === isset($actionList[$action]) ) {
+		echo "Help for action '" . $action . "':" . PHP_EOL;
+		$helpList = explode(PHP_EOL, $actionList[$action]['help']);
+		foreach ( $helpList as $helpItem ) {
+			s3b_echo($helpItem);
+		}
+	} else {
+		echo "No help for action '" . $action . "'." . PHP_EOL;
+	}
+	
+	echo PHP_EOL;
+	exit(0);
+}
+
+
+function s3b_parse_argv($start, $length, $option, &$list) {
+	$argList = array();
+	$j=$start;
+	$found_next=false;
+	do {
+		$arg = str_replace($option, NULL, $list[$j]);
+		if ( false !== stripos($arg, "=") ) {
+			if ( true == $found_next ) {
+				break;
+			}
+			$found_next=true;
+		}
+		$argList[] = $arg;
+		$j++;
+	} while ( $j < $length );
+	
+	return $argList;
+}
+
+exit(0);
